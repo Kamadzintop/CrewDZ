@@ -17,7 +17,11 @@ load_dotenv()
 
 # Импортируем нашу систему анализа
 try:
+<<<<<<< HEAD
     from fin_crew import analyze_investment_opportunity, cache_manager
+=======
+    from fin_crew import analyze_investment_opportunity
+>>>>>>> af05dce (предварительная версия)
     SYSTEM_AVAILABLE = True
 except ImportError as e:
     print(f"Ошибка импорта системы анализа: {e}")
@@ -50,7 +54,11 @@ class AnalysisTask:
             "decision_maker_analyst": "waiting",
             "news_analyst": "waiting",
             "risk_advisor": "waiting",
+<<<<<<< HEAD
             "final_validator": "waiting"
+=======
+            "validation_agent": "waiting"
+>>>>>>> af05dce (предварительная версия)
         }
     
     def update_progress(self, progress: int, agent: Optional[str] = None):
@@ -249,6 +257,7 @@ def get_tasks():
 @app.route('/api/health')
 def health_check():
     """Проверка состояния системы"""
+<<<<<<< HEAD
     cache_stats = {}
     if SYSTEM_AVAILABLE and cache_manager:
         try:
@@ -263,10 +272,13 @@ def health_check():
         except Exception as e:
             cache_stats = {'error': str(e)}
     
+=======
+>>>>>>> af05dce (предварительная версия)
     return jsonify({
         'status': 'healthy',
         'system_available': SYSTEM_AVAILABLE,
         'active_tasks': len(active_tasks),
+<<<<<<< HEAD
         'cache_stats': cache_stats,
         'timestamp': datetime.now().isoformat()
     })
@@ -315,6 +327,11 @@ def cache_stats():
     except Exception as e:
         return jsonify({'error': f'Ошибка получения статистики кеша: {str(e)}'}), 500
 
+=======
+        'timestamp': datetime.now().isoformat()
+    })
+
+>>>>>>> af05dce (предварительная версия)
 if __name__ == '__main__':
     # Запуск на нестандартном порту 8765
     debug_mode = os.getenv('DEBUG', 'False').lower() == 'true'
