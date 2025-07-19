@@ -203,7 +203,7 @@ OPENAI_API_BASE=https://api.openai.com/v1
    
    Отредактируйте файл `.env` и добавьте ваши API ключи:
    ```env
-   # ОБЯЗАТЕЛЬНО:  Минимум 2 API ключа для валидаторов
+   # ОБЯЗАТЕЛЬНО: Минимум 2 API ключа для валидаторов
    OPENAI_API_KEY=your_openai_api_key_here
    ANTHROPIC_API_KEY=your_anthropic_api_key_here
    DEEPSEEK_API_KEY=your_deepseek_api_key_here
