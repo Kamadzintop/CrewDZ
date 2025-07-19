@@ -5,6 +5,7 @@ crewai==0.148.0
 # Claude API поддержка
 anthropic==0.18.1
 
+
 # OpenAI API поддержка (для поиска)
 openai==1.97.0
 
