@@ -36,7 +36,11 @@ wheels/
 
 # Логи
 *.log
+analysis_debug.log
 
 # Временные файлы
 *.tmp
-*.temp 
+*.temp
+
+# Дополнительные исключения
+.cursorignore 

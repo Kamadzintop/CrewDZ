@@ -1,21 +1,23 @@
-# Зависимости проекта
-# Добавьте необходимые пакеты в формате: package==version
-
+# Зависимости проекта CrewDZ
 # Основные зависимости CrewAI
-crewai==0.28.0
-langchain==0.1.0
-langchain-openai==0.0.5
+crewai==0.148.0
+
+# Claude API поддержка
+anthropic==0.18.1
 
 # HTTP запросы
-requests==2.31.0
+requests==2.32.4
 
 # Работа с переменными окружения
-python-dotenv==1.0.0
+python-dotenv==1.1.1
 
 # Анализ данных
-pandas==2.1.4
-numpy==1.24.3
+pandas==2.3.1
+numpy==2.3.1
 
-# Дополнительные инструменты
-beautifulsoup4==4.12.2
-lxml==4.9.3 
+# Парсинг веб-страниц
+beautifulsoup4==4.13.4
+lxml==6.0.0
+
+# Веб-интерфейс
+flask==3.0.0 
