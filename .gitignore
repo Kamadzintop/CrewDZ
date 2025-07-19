@@ -47,4 +47,7 @@ analysis_debug.log
 
 # Кеш системы
 cache/
-*.pkl 
+*.pkl
+
+# Документация API (опциональная)
+API/ 
