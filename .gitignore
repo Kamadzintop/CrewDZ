@@ -43,4 +43,11 @@ analysis_debug.log
 *.temp
 
 # Дополнительные исключения
-.cursorignore 
+.cursorignore
+
+# Кеш системы
+cache/
+*.pkl
+
+# Документация API (опциональная)
+API/ 

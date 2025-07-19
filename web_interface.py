@@ -17,7 +17,7 @@ load_dotenv()
 
 # Импортируем нашу систему анализа
 try:
-    from fin_crew import analyze_investment_opportunity
+    from fin_crew import analyze_investment_opportunity, cache_manager
     SYSTEM_AVAILABLE = True
 except ImportError as e:
     print(f"Ошибка импорта системы анализа: {e}")
@@ -50,7 +50,7 @@ class AnalysisTask:
             "decision_maker_analyst": "waiting",
             "news_analyst": "waiting",
             "risk_advisor": "waiting",
-            "validation_agent": "waiting"
+            "final_validator": "waiting"
         }
     
     def update_progress(self, progress: int, agent: Optional[str] = None):
@@ -249,12 +249,71 @@ def get_tasks():
 @app.route('/api/health')
 def health_check():
     """Проверка состояния системы"""
+    cache_stats = {}
+    if SYSTEM_AVAILABLE and cache_manager:
+        try:
+            cache_dir = cache_manager.cache_dir
+            if os.path.exists(cache_dir):
+                cache_files = [f for f in os.listdir(cache_dir) if f.endswith('.pkl')]
+                cache_stats = {
+                    'cache_files_count': len(cache_files),
+                    'cache_dir': cache_dir,
+                    'cache_size_mb': sum(os.path.getsize(os.path.join(cache_dir, f)) for f in cache_files) / (1024 * 1024)
+                }
+        except Exception as e:
+            cache_stats = {'error': str(e)}
+    
     return jsonify({
         'status': 'healthy',
         'system_available': SYSTEM_AVAILABLE,
         'active_tasks': len(active_tasks),
+        'cache_stats': cache_stats,
         'timestamp': datetime.now().isoformat()
     })
+
+@app.route('/api/cache/clear', methods=['POST'])
+def clear_cache():
+    """Очистка кеша"""
+    try:
+        if not SYSTEM_AVAILABLE or not cache_manager:
+            return jsonify({'error': 'Система анализа недоступна'}), 500
+        
+        cleared_count = cache_manager.clear_old_cache()
+        return jsonify({
+            'success': True,
+            'cleared_count': cleared_count,
+            'message': f'Очищено {cleared_count} устаревших записей кеша'
+        })
+    except Exception as e:
+        return jsonify({'error': f'Ошибка очистки кеша: {str(e)}'}), 500
+
+@app.route('/api/cache/stats')
+def cache_stats():
+    """Статистика кеша"""
+    try:
+        if not SYSTEM_AVAILABLE or not cache_manager:
+            return jsonify({'error': 'Система анализа недоступна'}), 500
+        
+        cache_dir = cache_manager.cache_dir
+        if os.path.exists(cache_dir):
+            cache_files = [f for f in os.listdir(cache_dir) if f.endswith('.pkl')]
+            total_size = sum(os.path.getsize(os.path.join(cache_dir, f)) for f in cache_files)
+            
+            return jsonify({
+                'cache_files_count': len(cache_files),
+                'cache_size_bytes': total_size,
+                'cache_size_mb': total_size / (1024 * 1024),
+                'cache_dir': cache_dir
+            })
+        else:
+            return jsonify({
+                'cache_files_count': 0,
+                'cache_size_bytes': 0,
+                'cache_size_mb': 0,
+                'cache_dir': cache_dir
+            })
+    except Exception as e:
+        return jsonify({'error': f'Ошибка получения статистики кеша: {str(e)}'}), 500
 
 if __name__ == '__main__':
     # Запуск на нестандартном порту 8765

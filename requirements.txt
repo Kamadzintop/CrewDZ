@@ -5,6 +5,9 @@ crewai==0.148.0
 # Claude API поддержка
 anthropic==0.18.1
 
+# OpenAI API поддержка (для поиска)
+openai==1.97.0
+
 # HTTP запросы
 requests==2.32.4
 
@@ -20,4 +23,7 @@ beautifulsoup4==4.13.4
 lxml==6.0.0
 
 # Веб-интерфейс
-flask==3.0.0 
+flask==3.0.0
+
+# Кеширование и сериализация
+pickle5==0.0.12 
