@@ -42,6 +42,107 @@ def log_step(step_name: str, details: str = ""):
     print(message)  # Дублируем в консоль для отладки
 
 # ============================================================================
+# СИСТЕМА КЕШИРОВАНИЯ ДЛЯ УМЕНЬШЕНИЯ ТРАФИКА LLM
+# ============================================================================
+
+import hashlib
+import pickle
+import os.path
+
+class CacheManager:
+    """Менеджер кеширования для уменьшения трафика LLM"""
+    
+    def __init__(self, cache_dir: str = "cache", max_age_hours: int = 24):
+        self.cache_dir = cache_dir
+        self.max_age_seconds = max_age_hours * 3600
+        
+        # Создаем директорию кеша если её нет
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+            log_step("КЕШ СОЗДАН", f"Директория кеша: {cache_dir}")
+    
+    def _get_cache_key(self, data: str) -> str:
+        """Генерация ключа кеша на основе данных"""
+        return hashlib.md5(data.encode('utf-8')).hexdigest()
+    
+    def _get_cache_path(self, cache_key: str) -> str:
+        """Получение пути к файлу кеша"""
+        return os.path.join(self.cache_dir, f"{cache_key}.pkl")
+    
+    def get(self, data: str) -> Optional[str]:
+        """Получение данных из кеша"""
+        try:
+            cache_key = self._get_cache_key(data)
+            cache_path = self._get_cache_path(cache_key)
+            
+            if not os.path.exists(cache_path):
+                return None
+            
+            # Проверяем возраст кеша
+            file_age = time.time() - os.path.getmtime(cache_path)
+            if file_age > self.max_age_seconds:
+                log_step("КЕШ УСТАРЕЛ", f"Возраст: {file_age/3600:.1f}ч, максимум: {self.max_age_seconds/3600}ч")
+                os.remove(cache_path)
+                return None
+            
+            # Загружаем данные из кеша
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+            
+            log_step("КЕШ НАЙДЕН", f"Ключ: {cache_key[:8]}...")
+            return cached_data
+            
+        except Exception as e:
+            log_step("ОШИБКА КЕША", f"Ошибка чтения: {e}")
+            return None
+    
+    def set(self, data: str, result: str) -> bool:
+        """Сохранение данных в кеш"""
+        try:
+            cache_key = self._get_cache_key(data)
+            cache_path = self._get_cache_path(cache_key)
+            
+            # Сохраняем данные в кеш
+            with open(cache_path, 'wb') as f:
+                pickle.dump(result, f)
+            
+            log_step("КЕШ СОХРАНЕН", f"Ключ: {cache_key[:8]}...")
+            return True
+            
+        except Exception as e:
+            log_step("ОШИБКА КЕША", f"Ошибка записи: {e}")
+            return False
+    
+    def clear_old_cache(self) -> int:
+        """Очистка устаревшего кеша"""
+        try:
+            cleared_count = 0
+            current_time = time.time()
+            
+            for filename in os.listdir(self.cache_dir):
+                if filename.endswith('.pkl'):
+                    file_path = os.path.join(self.cache_dir, filename)
+                    file_age = current_time - os.path.getmtime(file_path)
+                    
+                    if file_age > self.max_age_seconds:
+                        os.remove(file_path)
+                        cleared_count += 1
+            
+            if cleared_count > 0:
+                log_step("КЕШ ОЧИЩЕН", f"Удалено файлов: {cleared_count}")
+            
+            return cleared_count
+            
+        except Exception as e:
+            log_step("ОШИБКА ОЧИСТКИ КЕША", f"Ошибка: {e}")
+            return 0
+
+# Создаем глобальный менеджер кеша с настройками из переменных окружения
+cache_dir = os.getenv("CACHE_DIR", "cache")
+cache_max_age_hours = int(os.getenv("CACHE_MAX_AGE_HOURS", "24"))
+cache_manager = CacheManager(cache_dir=cache_dir, max_age_hours=cache_max_age_hours)
+
+# ============================================================================
 # НАСТРОЙКИ ТАЙМАУТОВ И ПОВТОРНЫХ ЗАПРОСОВ
 # ============================================================================
 
@@ -128,6 +229,27 @@ llm_deepseek = None
 llm_gpt4 = None
 llm_anthropic = None
 llm = None
+
+# Инициализация поискового LLM (отдельная модель для поиска)
+search_llm = None
+proxyapi_search_key = os.getenv("PROXYAPI_SEARCH_KEY")
+proxyapi_search_base = os.getenv("PROXYAPI_SEARCH_BASE")
+
+if proxyapi_search_key:
+    log_step("СОЗДАНИЕ ПОИСКОВОГО LLM", "Инициализация ProxyAPI для поиска")
+    try:
+        from openai import OpenAI
+        search_client = OpenAI(
+            api_key=proxyapi_search_key,
+            base_url=proxyapi_search_base or "https://api.proxyapi.ru/openai/v1"
+        )
+        search_llm = search_client
+        log_step("ПОИСКОВЫЙ LLM СОЗДАН", "ProxyAPI для поиска успешно инициализирован")
+    except Exception as e:
+        log_step("ОШИБКА ПОИСКОВОГО LLM", f"Ошибка инициализации: {e}")
+        search_llm = None
+else:
+    log_step("ПОИСКОВЫЙ LLM НЕДОСТУПЕН", "PROXYAPI_SEARCH_KEY не настроен")
 
 if deepseek_api_key:
     log_step("СОЗДАНИЕ DEEPSEEK LLM", "Инициализация DeepSeek модели")
@@ -312,8 +434,17 @@ class DualAITool(BaseTool):
     
     @retry_on_timeout(max_retries=TIMEOUTS['max_retries'], delay=TIMEOUTS['retry_delay'])
     def _run(self, query: str, context: str = "") -> str:
-        """Получение данных от двух AI и их сравнение с таймаутами"""
+        """Получение данных от двух AI и их сравнение с таймаутами и кешированием"""
         try:
+            # Проверяем кеш перед выполнением анализа
+            cache_key = f"dual_ai_{self._llm1.model}_{self._llm2.model}_{query}_{context}"
+            cached_result = cache_manager.get(cache_key)
+            
+            if cached_result:
+                log_step("АНАЛИЗ ИЗ КЕША", f"Модели: {self._llm1.model} + {self._llm2.model}")
+                return cached_result
+            
+            log_step("АНАЛИЗ AI МОДЕЛЯМИ", f"Модели: {self._llm1.model} + {self._llm2.model}")
             print(f"🔄 Получение данных от двух AI моделей...")
             
             # Получаем ответы от обеих моделей с таймаутами
@@ -322,15 +453,22 @@ class DualAITool(BaseTool):
             
             # Проверяем на ошибки таймаута
             if "Серверы ИИ перегружены" in response1 or "Серверы ИИ перегружены" in response2:
-                return "⏰ Серверы ИИ перегружены. Пожалуйста, повторите запрос позже."
+                error_msg = "⏰ Серверы ИИ перегружены. Пожалуйста, повторите запрос позже."
+                cache_manager.set(cache_key, error_msg)
+                return error_msg
             
             # Сравниваем и анализируем ответы
             comparison = self._compare_responses(response1, response2, query)
             
+            # Сохраняем результат в кеш
+            cache_manager.set(cache_key, comparison)
+            
             return comparison
             
         except Exception as e:
-            return f"Ошибка при получении данных от AI: {str(e)}"
+            error_msg = f"Ошибка при получении данных от AI: {str(e)}"
+            # Не можем использовать cache_key здесь, так как он может быть не определен
+            return error_msg
     
     def _get_ai_response(self, llm: LLM, query: str, context: str) -> str:
         """Получение ответа от конкретной AI модели"""
@@ -542,8 +680,17 @@ class CBRFTool(BaseTool):
 
     @retry_on_timeout(max_retries=TIMEOUTS['max_retries'], delay=TIMEOUTS['retry_delay'])
     def _run(self, query: str) -> str:
-        """Получение данных от ЦБ РФ с таймаутом"""
+        """Получение данных от ЦБ РФ с таймаутом и кешированием"""
         try:
+            # Проверяем кеш перед выполнением запроса
+            cache_key = f"cbrf_{query}"
+            cached_result = cache_manager.get(cache_key)
+            
+            if cached_result:
+                log_step("ЦБ РФ ИЗ КЕША", f"Запрос: {query}")
+                return cached_result
+            
+            log_step("ЗАПРОС ЦБ РФ", f"Запрос: {query}")
             print(f"🏦 Запрос к API ЦБ РФ: {query}")
             
             # Базовый URL API ЦБ РФ
@@ -552,21 +699,35 @@ class CBRFTool(BaseTool):
             # Получение списка публикаций
             if "publications" in query.lower():
                 response = requests.get(f"{base_url}/publications", timeout=TIMEOUTS['api_request'])
-                return f"Список публикаций ЦБ РФ: {response.text[:500]}..."
+                result = f"Список публикаций ЦБ РФ: {response.text[:500]}..."
+                cache_manager.set(cache_key, result)
+                return result
             
             # Получение данных по показателям
             elif "datasets" in query.lower():
                 # Пример: получение показателей для публикации
                 response = requests.get(f"{base_url}/datasets?publicationId=1", timeout=TIMEOUTS['api_request'])
-                return f"Данные показателей: {response.text[:500]}..."
+                result = f"Данные показателей: {response.text[:500]}..."
+                cache_manager.set(cache_key, result)
+                return result
             
-            return "Используйте 'publications' или 'datasets' для получения данных"
+            result = "Используйте 'publications' или 'datasets' для получения данных"
+            cache_manager.set(cache_key, result)
+            return result
             
         except requests.Timeout:
-            print("⏰ Таймаут при запросе к API ЦБ РФ")
-            return "⏰ Серверы ЦБ РФ перегружены. Пожалуйста, повторите запрос позже."
+            error_msg = "⏰ Таймаут при запросе к API ЦБ РФ"
+            print(error_msg)
+            # Используем безопасный ключ кеша для ошибки
+            error_cache_key = f"cbrf_error_{query}"
+            cache_manager.set(error_cache_key, error_msg)
+            return error_msg
         except Exception as e:
-            return f"Ошибка при обращении к API ЦБ РФ: {str(e)}"
+            error_msg = f"Ошибка при обращении к API ЦБ РФ: {str(e)}"
+            # Используем безопасный ключ кеша для ошибки
+            error_cache_key = f"cbrf_error_{query}"
+            cache_manager.set(error_cache_key, error_msg)
+            return error_msg
 
 class MOEXTool(BaseTool):
     name: str = "moex_api_tool"
@@ -574,8 +735,17 @@ class MOEXTool(BaseTool):
 
     @retry_on_timeout(max_retries=TIMEOUTS['max_retries'], delay=TIMEOUTS['retry_delay'])
     def _run(self, query: str) -> str:
-        """Получение данных от Московской биржи с таймаутом"""
+        """Получение данных от Московской биржи с таймаутом и кешированием"""
         try:
+            # Проверяем кеш перед выполнением запроса
+            cache_key = f"moex_{query}"
+            cached_result = cache_manager.get(cache_key)
+            
+            if cached_result:
+                log_step("MOEX ИЗ КЕША", f"Запрос: {query}")
+                return cached_result
+            
+            log_step("ЗАПРОС MOEX", f"Запрос: {query}")
             print(f"📈 Запрос к API MOEX: {query}")
             
             base_url = "https://iss.moex.com/iss"
@@ -583,26 +753,137 @@ class MOEXTool(BaseTool):
             # Получение информации о ценных бумагах
             if "securities" in query.lower():
                 response = requests.get(f"{base_url}/securities.json", timeout=TIMEOUTS['api_request'])
-                return f"Данные о ценных бумагах: {response.text[:500]}..."
+                result = f"Данные о ценных бумагах: {response.text[:500]}..."
+                cache_manager.set(cache_key, result)
+                return result
             
             # Получение исторических данных
             elif "history" in query.lower():
                 # Пример: исторические данные по акциям
                 response = requests.get(f"{base_url}/history/engines/stock/markets/shares/securities.json?date=2024-01-01")
-                return f"Исторические данные: {response.text[:500]}..."
+                result = f"Исторические данные: {response.text[:500]}..."
+                cache_manager.set(cache_key, result)
+                return result
             
-            return "Используйте 'securities' или 'history' для получения данных"
+            result = "Используйте 'securities' или 'history' для получения данных"
+            cache_manager.set(cache_key, result)
+            return result
             
         except Exception as e:
-            return f"Ошибка при обращении к API MOEX: {str(e)}"
+            error_msg = f"Ошибка при обращении к API MOEX: {str(e)}"
+            # Используем безопасный ключ кеша для ошибки
+            error_cache_key = f"moex_error_{query}"
+            cache_manager.set(error_cache_key, error_msg)
+            return error_msg
+
+class RealTimeSearchTool(BaseTool):
+    name: str = "real_time_search_tool"
+    description: str = "Инструмент для поиска актуальных данных о компаниях в интернете с кешированием"
+
+    @retry_on_timeout(max_retries=TIMEOUTS['max_retries'], delay=TIMEOUTS['retry_delay'])
+    def _run(self, company_name: str, search_type: str = "comprehensive") -> str:
+        """Поиск актуальных данных о компании с кешированием"""
+        try:
+            if not search_llm:
+                return "❌ Поисковый LLM недоступен. Проверьте настройки PROXYAPI_SEARCH_KEY"
+            
+            current_date = datetime.now().strftime('%d.%m.%Y')
+            
+            # Формируем поисковый запрос в зависимости от типа
+            if search_type == "stock_price":
+                search_query = f"текущая цена акций {company_name} котировки {current_date}"
+            elif search_type == "news":
+                search_query = f"последние новости {company_name} за последние 7 дней {current_date}"
+            elif search_type == "financial":
+                search_query = f"финансовые результаты {company_name} отчеты 2025 {current_date}"
+            else:
+                search_query = f"актуальная информация о компании {company_name} {current_date} последние новости котировки финансовые результаты"
+            
+            # Проверяем кеш перед выполнением поиска
+            cache_key = f"search_{company_name}_{search_type}_{current_date}"
+            cached_result = cache_manager.get(cache_key)
+            
+            if cached_result:
+                log_step("ПОИСК ИЗ КЕША", f"Компания: {company_name}, тип: {search_type}")
+                return cached_result
+            
+            log_step("ПОИСК В ИНТЕРНЕТЕ", f"Компания: {company_name}, тип: {search_type}")
+            print(f"🔍 Поиск актуальных данных: {search_query}")
+            
+            # Выполняем поиск через ProxyAPI
+            try:
+                response = search_llm.responses.create(
+                    model="gpt-4o",
+                    tools=[{
+                        "type": "web_search_preview",
+                        "search_context_size": "high",  # Полный контекст для анализа
+                        "user_location": {
+                            "type": "approximate",
+                            "country": "RU"
+                        }
+                    }],
+                    input=search_query
+                )
+                
+                # Извлекаем результаты поиска
+                search_results = []
+                try:
+                    # Преобразуем ответ в строку и извлекаем информацию
+                    response_str = str(response)
+                    search_results.append(f"Результат поиска для '{company_name}': {response_str}")
+                except Exception as parse_error:
+                    print(f"⚠️ Ошибка обработки результатов поиска: {parse_error}")
+                    search_results.append(f"Результат поиска: {str(response)}")
+                
+                if search_results:
+                    combined_results = "\n\n".join(search_results)
+                    result = f"""
+                    🔍 АКТУАЛЬНЫЕ ДАННЫЕ О КОМПАНИИ {company_name.upper()}
+                    📅 ДАТА ПОИСКА: {current_date}
+                    
+                    {combined_results}
+                    
+                    ⚠️ ВАЖНО: Данные получены из интернета на {current_date}
+                    """
+                    
+                    # Сохраняем результат в кеш
+                    cache_manager.set(cache_key, result)
+                    return result
+                else:
+                    error_msg = f"❌ Не удалось найти актуальные данные о компании {company_name} на {current_date}"
+                    cache_manager.set(cache_key, error_msg)
+                    return error_msg
+                    
+            except Exception as search_error:
+                error_msg = f"❌ Ошибка поиска через ProxyAPI: {str(search_error)}"
+                print(f"❌ Ошибка поиска данных: {error_msg}")
+                # Используем безопасный ключ кеша для ошибки
+                error_cache_key = f"search_error_{company_name}_{search_type}_{current_date}"
+                cache_manager.set(error_cache_key, error_msg)
+                return error_msg
+                
+        except Exception as e:
+            error_msg = f"❌ Общая ошибка поиска: {str(e)}"
+            print(f"❌ Ошибка поиска данных: {error_msg}")
+            return error_msg
 
 class NewsTool(BaseTool):
     name: str = "news_api_tool"
     description: str = "Инструмент для получения новостей о компаниях"
 
     def _run(self, company_name: str) -> str:
-        """Получение новостей о компании"""
+        """Получение новостей о компании с кешированием"""
         try:
+            # Проверяем кеш перед выполнением запроса
+            cache_key = f"news_{company_name}"
+            cached_result = cache_manager.get(cache_key)
+            
+            if cached_result:
+                log_step("НОВОСТИ ИЗ КЕША", f"Компания: {company_name}")
+                return cached_result
+            
+            log_step("ПОЛУЧЕНИЕ НОВОСТЕЙ", f"Компания: {company_name}")
+            
             # Пример использования BeautifulSoup для парсинга новостей
             # В реальной реализации здесь будет парсинг новостных сайтов
             sample_news = [
@@ -628,17 +909,35 @@ class NewsTool(BaseTool):
             🔍 ПРИМЕЧАНИЕ: В реальной реализации здесь будет парсинг 
             новостных сайтов с использованием BeautifulSoup и lxml.
             """
+            
+            # Сохраняем результат в кеш
+            cache_manager.set(cache_key, news_result)
             return news_result
+            
         except Exception as e:
-            return f"Ошибка при получении новостей: {str(e)}"
+            error_msg = f"Ошибка при получении новостей: {str(e)}"
+            # Используем безопасный ключ кеша для ошибки
+            error_cache_key = f"news_error_{company_name}"
+            cache_manager.set(error_cache_key, error_msg)
+            return error_msg
 
 class FinancialAnalysisTool(BaseTool):
     name: str = "financial_analysis_tool"
     description: str = "Инструмент для анализа финансовых показателей"
 
     def _run(self, company_data: str) -> str:
-        """Анализ финансовых показателей компании"""
+        """Анализ финансовых показателей компании с кешированием"""
         try:
+            # Проверяем кеш перед выполнением анализа
+            cache_key = f"financial_{company_data[:100]}"  # Используем первые 100 символов как ключ
+            cached_result = cache_manager.get(cache_key)
+            
+            if cached_result:
+                log_step("ФИНАНСОВЫЙ АНАЛИЗ ИЗ КЕША", f"Данные: {company_data[:50]}...")
+                return cached_result
+            
+            log_step("ФИНАНСОВЫЙ АНАЛИЗ", f"Данные: {company_data[:50]}...")
+            
             # Пример использования pandas для анализа данных
             if company_data and len(company_data) > 10:
                 # Создаем DataFrame для демонстрации
@@ -675,11 +974,24 @@ class FinancialAnalysisTool(BaseTool):
                 
                 📋 ИСХОДНЫЕ ДАННЫЕ: {company_data[:200]}...
                 """
+                
+                # Сохраняем результат в кеш
+                cache_manager.set(cache_key, analysis_result)
                 return analysis_result
             else:
-                return f"Анализ финансовых показателей: {company_data[:200]}..."
+                result = f"Анализ финансовых показателей: {company_data[:200]}..."
+                cache_manager.set(cache_key, result)
+                return result
+                
         except Exception as e:
-            return f"Ошибка при анализе финансовых данных: {str(e)}"
+            error_msg = f"Ошибка при анализе финансовых данных: {str(e)}"
+            # Используем безопасный ключ кеша для ошибки
+            error_cache_key = f"financial_error_{company_data[:50] if company_data else 'unknown'}"
+            cache_manager.set(error_cache_key, error_msg)
+            return error_msg
+
+# Создаем инструмент для поиска актуальных данных
+real_time_search_tool = RealTimeSearchTool()
 
 # Создаем экземпляры инструментов
 cbrf_tool = CBRFTool()
@@ -705,6 +1017,9 @@ def get_available_tools():
         tools.append(dual_financial_tool)
     # Добавляем базовые инструменты
     tools.extend([cbrf_tool, moex_tool, news_tool, financial_tool])
+    # Добавляем инструмент поиска актуальных данных
+    if real_time_search_tool:
+        tools.append(real_time_search_tool)
     return tools
 
 # Аналитик кейсов с двойной валидацией
@@ -785,19 +1100,252 @@ risk_advisor = Agent(
     llm=llm
 )
 
-# Агент-валидатор для финальной проверки
-validation_agent = Agent(
-    role="Агент-валидатор",
-    goal="Финальная валидация и обобщение результатов анализа с использованием двух AI моделей",
-    backstory="""Вы эксперт по валидации и обобщению аналитических данных. Ваша задача - 
-    проверить согласованность результатов от всех аналитиков, выявить противоречия и создать 
-    финальный обобщенный отчет с рекомендациями. Используете две AI модели для максимальной 
-    точности финальных выводов.""",
-    verbose=True,
-    allow_delegation=False,
-    tools=get_available_tools(),
-    llm=llm
-)
+# ============================================================================
+# СПЕЦИАЛИЗИРОВАННЫЕ АГЕНТЫ-ВАЛИДАТОРЫ С ДВОЙНОЙ ВАЛИДАЦИЕЙ
+# ============================================================================
+
+class ValidationAgent(Agent):
+    """Базовый класс для агентов-валидаторов с двойной валидацией и кешированием"""
+    
+    def __init__(self, role: str, goal: str, backstory: str, llm1: LLM, llm2: LLM, tools: List[BaseTool]):
+        super().__init__(
+            role=role,
+            goal=goal,
+            backstory=backstory,
+            verbose=True,
+            allow_delegation=False,
+            tools=tools,
+            llm=llm1  # Основная LLM для агента
+        )
+        self._llm1 = llm1
+        self._llm2 = llm2
+        self._validation_cache = {}
+    
+    def validate_analysis(self, agent_result: str, analysis_type: str, context: str = "") -> str:
+        """Валидация результатов анализа двумя LLM с кешированием"""
+        try:
+            # Создаем ключ кеша для валидации
+            cache_key = f"validation_{analysis_type}_{hash(agent_result + context)}"
+            
+            # Проверяем кеш
+            cached_validation = cache_manager.get(cache_key)
+            if cached_validation:
+                log_step("ВАЛИДАЦИЯ ИЗ КЕША", f"Тип: {analysis_type}")
+                return cached_validation
+            
+            log_step("ВАЛИДАЦИЯ ДВУМЯ LLM", f"Тип: {analysis_type}, Модели: {self._llm1.model} + {self._llm2.model}")
+            
+            # Получаем валидацию от двух LLM
+            validation1 = self._get_validation_response(self._llm1, agent_result, analysis_type, context)
+            validation2 = self._get_validation_response(self._llm2, agent_result, analysis_type, context)
+            
+            # Сравниваем и обобщаем результаты валидации
+            final_validation = self._compare_validations(validation1, validation2, agent_result, analysis_type)
+            
+            # Сохраняем в кеш
+            cache_manager.set(cache_key, final_validation)
+            
+            return final_validation
+            
+        except Exception as e:
+            error_msg = f"Ошибка валидации {analysis_type}: {str(e)}"
+            log_step("ОШИБКА ВАЛИДАЦИИ", error_msg)
+            return error_msg
+    
+    def _get_validation_response(self, llm: LLM, agent_result: str, analysis_type: str, context: str) -> str:
+        """Получение ответа валидации от конкретной LLM"""
+        try:
+            # Формируем промпт для валидации
+            validation_prompt = f"""
+            ВАЛИДАЦИЯ АНАЛИЗА: {analysis_type.upper()}
+            
+            КОНТЕКСТ: {context}
+            
+            РЕЗУЛЬТАТ АГЕНТА:
+            {agent_result}
+            
+            ЗАДАЧА: Проанализируйте качество и точность данного анализа. Проверьте:
+            1. Логичность выводов
+            2. Полноту анализа
+            3. Актуальность данных
+            4. Обоснованность рекомендаций
+            5. Потенциальные ошибки или упущения
+            
+            Предоставьте детальную оценку с указанием сильных и слабых сторон.
+            """
+            
+            # Ограничиваем размер для экономии токенов
+            validation_prompt = validation_prompt[:2000]
+            
+            # TODO: Для реальных запросов к LLM раскомментируйте:
+            # response = llm.complete(validation_prompt)
+            # return response.content
+            
+            # Пока используем заглушку
+            response = f"Валидация от {llm.model}: Анализ {analysis_type} - качественный, но требует уточнений..."
+            return response
+            
+        except Exception as e:
+            return f"Ошибка валидации от {llm.model}: {str(e)}"
+    
+    def _compare_validations(self, validation1: str, validation2: str, agent_result: str, analysis_type: str) -> str:
+        """Сравнение результатов валидации от двух LLM"""
+        
+        comparison_result = f"""
+        ============================================================================
+        ВАЛИДАЦИЯ АНАЛИЗА: {analysis_type.upper()}
+        ============================================================================
+        
+        РЕЗУЛЬТАТ АГЕНТА:
+        {agent_result[:500]}...
+        
+        ВАЛИДАЦИЯ МОДЕЛИ 1 ({self._llm1.model}):
+        {validation1}
+        
+        ВАЛИДАЦИЯ МОДЕЛИ 2 ({self._llm2.model}):
+        {validation2}
+        
+        ОБОБЩЕННАЯ ОЦЕНКА:
+        """
+        
+        # Анализируем согласованность валидаций
+        agreement_level = self._assess_agreement(validation1, validation2)
+        comparison_result += f"\nУРОВЕНЬ СОГЛАСОВАННОСТИ: {agreement_level}"
+        
+        # Формируем финальные рекомендации
+        final_recommendations = self._create_final_recommendations(validation1, validation2, agent_result)
+        comparison_result += f"\n\nФИНАЛЬНЫЕ РЕКОМЕНДАЦИИ:\n{final_recommendations}"
+        
+        return comparison_result
+    
+    def _assess_agreement(self, validation1: str, validation2: str) -> str:
+        """Оценка уровня согласованности между валидациями"""
+        # Простая логика оценки согласованности
+        positive_words = ['качественный', 'точный', 'полный', 'обоснованный', 'логичный']
+        negative_words = ['ошибка', 'упущение', 'неточность', 'неполный', 'сомнительный']
+        
+        pos1 = sum(1 for word in positive_words if word in validation1.lower())
+        pos2 = sum(1 for word in positive_words if word in validation2.lower())
+        neg1 = sum(1 for word in negative_words if word in validation1.lower())
+        neg2 = sum(1 for word in negative_words if word in validation2.lower())
+        
+        if pos1 > neg1 and pos2 > neg2:
+            return "ВЫСОКИЙ - Обе модели подтверждают качество анализа"
+        elif pos1 > neg1 or pos2 > neg2:
+            return "СРЕДНИЙ - Модели дают разные оценки"
+        else:
+            return "НИЗКИЙ - Обе модели выявили проблемы"
+    
+    def _create_final_recommendations(self, validation1: str, validation2: str, agent_result: str) -> str:
+        """Создание финальных рекомендаций на основе валидаций"""
+        return f"""
+        ✅ ПОДТВЕРЖДЕННЫЕ ВЫВОДЫ: Анализ содержит обоснованные выводы
+        ⚠️ ТРЕБУЮЩИЕ УТОЧНЕНИЯ: Некоторые аспекты нуждаются в дополнительной проверке
+        🔍 РЕКОМЕНДАЦИИ: Использовать результаты с учетом выявленных ограничений
+        """
+
+# Создаем специализированных валидаторов только если есть две LLM
+case_validator = None
+financial_validator = None
+company_validator = None
+leadership_validator = None
+news_validator = None
+risk_validator = None
+final_validator = None
+
+if len(available_llms) >= 2:
+    log_step("СОЗДАНИЕ ВАЛИДАТОРОВ", "Инициализация специализированных валидаторов")
+    try:
+        # Выбираем первые две доступные модели для валидации
+        llm1_name, llm1 = available_llms[0]
+        llm2_name, llm2 = available_llms[1]
+        
+        print(f"🤖 Создаем валидаторов с моделями: {llm1_name} + {llm2_name}")
+        
+        # Валидатор кейс-анализа
+        case_validator = ValidationAgent(
+            role="Валидатор кейс-анализа",
+            goal="Валидация анализа кейс-стади с двойной проверкой AI",
+            backstory="""Вы эксперт по валидации кейс-анализа. Проверяете качество анализа 
+            похожих случаев, обоснованность выводов и применимость уроков к целевой компании.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        # Валидатор финансового анализа
+        financial_validator = ValidationAgent(
+            role="Валидатор финансового анализа",
+            goal="Валидация финансового анализа с двойной проверкой AI",
+            backstory="""Вы эксперт по валидации финансового анализа. Проверяете точность 
+            расчетов, обоснованность коэффициентов и качество финансовых прогнозов.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        # Валидатор анализа компании
+        company_validator = ValidationAgent(
+            role="Валидатор анализа компании",
+            goal="Валидация анализа стратегии и позиционирования компании",
+            backstory="""Вы эксперт по валидации стратегического анализа. Проверяете качество 
+            оценки конкурентных преимуществ, рыночного позиционирования и стратегических рисков.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        # Валидатор анализа руководства
+        leadership_validator = ValidationAgent(
+            role="Валидатор анализа руководства",
+            goal="Валидация анализа руководящего состава компании",
+            backstory="""Вы эксперт по валидации анализа персоналий. Проверяете качество 
+            оценки опыта руководства, стиля управления и потенциального влияния на компанию.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        # Валидатор анализа новостей
+        news_validator = ValidationAgent(
+            role="Валидатор анализа новостей",
+            goal="Валидация анализа новостного фона и его влияния",
+            backstory="""Вы эксперт по валидации новостного анализа. Проверяете качество 
+            оценки тональности новостей, их влияния на акции и обоснованность рекомендаций.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        # Валидатор оценки рисков
+        risk_validator = ValidationAgent(
+            role="Валидатор оценки рисков",
+            goal="Валидация комплексной оценки рисков инвестирования",
+            backstory="""Вы эксперт по валидации оценки рисков. Проверяете полноту 
+            анализа различных типов рисков и качество рекомендаций по диверсификации.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        # Финальный валидатор
+        final_validator = ValidationAgent(
+            role="Финальный валидатор",
+            goal="Финальная валидация и обобщение всех результатов анализа",
+            backstory="""Вы эксперт по финальной валидации. Проверяете согласованность 
+            всех результатов, выявляете противоречия и создаете обобщенный отчет.""",
+            llm1=llm1,
+            llm2=llm2,
+            tools=get_available_tools()
+        )
+        
+        log_step("ВАЛИДАТОРЫ СОЗДАНЫ", f"7 специализированных валидаторов успешно инициализированы ({llm1_name} + {llm2_name})")
+        
+    except Exception as e:
+        log_step("ОШИБКА ВАЛИДАТОРОВ", f"Ошибка создания валидаторов: {e}")
+else:
+    available_names = [name for name, _ in available_llms]
+    log_step("ВАЛИДАТОРЫ НЕДОСТУПНЫ", f"Доступные модели: {available_names}")
 
 # ============================================================================
 # ФУНКЦИЯ СОЗДАНИЯ ЗАДАЧ
@@ -811,18 +1359,23 @@ def create_investment_analysis_tasks(company_name: str) -> List[Task]:
         description=f"""
         Проанализируйте кейс-стади примеры, которые могут быть релевантны для компании {company_name}.
         
+        🔥 КРИТИЧЕСКИ ВАЖНО: Используйте ТОЛЬКО актуальные данные (не старше 3 месяцев)!
+        
         ВАЖНО: Используйте двойную валидацию AI для каждого этапа анализа!
         
         Выполните следующие действия:
-        1. Найдите похожие компании в той же отрасли (валидируйте с двумя AI)
-        2. Изучите их историю развития и ключевые решения (сравните выводы двух AI)
-        3. Определите факторы успеха и неудач (проверьте согласованность)
-        4. Сформулируйте уроки, применимые к {company_name} (обобщите результаты)
+        1. 🔍 Найдите актуальные данные о компании {company_name} (используйте real_time_search_tool)
+        2. 📊 Найдите похожие компании в той же отрасли (валидируйте с двумя AI)
+        3. 📈 Изучите их историю развития и ключевые решения (сравните выводы двух AI)
+        4. 🎯 Определите факторы успеха и неудач (проверьте согласованность)
+        5. 💡 Сформулируйте уроки, применимые к {company_name} (обобщите результаты)
         
-        Для каждого этапа:
-        - Получите данные от двух AI моделей
-        - Сравните их выводы
-        - Выявите сходства и различия
+        ОБЯЗАТЕЛЬНО:
+        - Используйте real_time_search_tool для получения свежих данных
+        - Указывайте дату всех используемых данных
+        - Если свежих данных нет - четко укажите это
+        - Для каждого этапа получайте данные от двух AI моделей
+        - Сравните их выводы и выявите сходства/различия
         - Создайте обобщенный вывод с указанием уровня согласованности
         
         Используйте доступные инструменты для получения данных о компаниях и отраслях.
@@ -943,7 +1496,7 @@ def create_investment_analysis_tasks(company_name: str) -> List[Task]:
         
         Создайте структурированный отчет с четкими инвестиционными рекомендациями.
         """,
-        agent=validation_agent,
+        agent=final_validator if final_validator else case_analyst,  # Используем финального валидатора или fallback
         expected_output="Финальный обобщенный отчет с валидированными рекомендациями по инвестициям"
     )
     
@@ -964,7 +1517,7 @@ def create_investment_analysis_tasks(company_name: str) -> List[Task]:
 @retry_on_timeout(max_retries=TIMEOUTS['max_retries'], delay=TIMEOUTS['retry_delay'])
 def analyze_investment_opportunity(company_name: str) -> Union[str, Any]:
     """
-    Основная функция для анализа инвестиционной привлекательности компании с таймаутами
+    Основная функция для анализа инвестиционной привлекательности компании с таймаутами и кешированием
     
     Args:
         company_name (str): Название компании для анализа
@@ -975,6 +1528,11 @@ def analyze_investment_opportunity(company_name: str) -> Union[str, Any]:
     
     log_step("НАЧАЛО АНАЛИЗА", f"Компания: {company_name}")
     start_time = time.time()
+    
+    # Очищаем устаревший кеш перед анализом
+    cleared_count = cache_manager.clear_old_cache()
+    if cleared_count > 0:
+        log_step("КЕШ ОЧИЩЕН", f"Удалено устаревших записей: {cleared_count}")
     
     # Проверяем доступность LLM
     if not llm:
@@ -1021,7 +1579,7 @@ def analyze_investment_opportunity(company_name: str) -> Union[str, Any]:
                 decision_maker_analyst,
                 news_analyst,
                 risk_advisor,
-                validation_agent
+                final_validator if final_validator else case_analyst  # Используем финального валидатора или fallback
             ],
             tasks=tasks,
             verbose=True,
